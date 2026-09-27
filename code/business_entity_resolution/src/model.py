@@ -20,21 +20,29 @@ PARAMS = dict(
 
 def oof_predict(X, y, groups, n_folds=5, rounds=500, params=None):
     params = params or PARAMS
-    oof = np.zeros(len(y))
+    oof = np.zeros(len(y), dtype=np.float32)
     best_iters = []
     gkf = GroupKFold(n_splits=n_folds)
-    for tr, va in gkf.split(X, y, groups):
-        dtr = lgb.Dataset(X.iloc[tr], y[tr])
-        dva = lgb.Dataset(X.iloc[va], y[va])
+    feature_names = list(X.columns) if hasattr(X, "columns") else None
+    X_arr = np.ascontiguousarray(X.to_numpy(dtype=np.float32) if hasattr(X, "to_numpy") else X, dtype=np.float32)
+    y_arr = np.ascontiguousarray(y, dtype=np.float32)
+
+    for tr, va in gkf.split(X_arr, y_arr, groups):
+        dtr = lgb.Dataset(X_arr[tr], label=y_arr[tr], feature_name=feature_names, free_raw_data=False)
+        dva = lgb.Dataset(X_arr[va], label=y_arr[va], reference=dtr, feature_name=feature_names, free_raw_data=False)
         m = lgb.train(params, dtr, rounds, valid_sets=[dva],
                       callbacks=[lgb.early_stopping(30, verbose=False)])
-        oof[va] = m.predict(X.iloc[va], num_iteration=m.best_iteration)
+        oof[va] = m.predict(X_arr[va], num_iteration=m.best_iteration)
         best_iters.append(m.best_iteration or rounds)
     return oof, int(np.mean(best_iters))
 
 
 def fit_full(X, y, rounds, params=None):
-    return lgb.train(params or PARAMS, lgb.Dataset(X, y), max(rounds, 50))
+    feature_names = list(X.columns) if hasattr(X, "columns") else None
+    X_arr = np.ascontiguousarray(X.to_numpy(dtype=np.float32) if hasattr(X, "to_numpy") else X, dtype=np.float32)
+    y_arr = np.ascontiguousarray(y, dtype=np.float32)
+    ds = lgb.Dataset(X_arr, label=y_arr, feature_name=feature_names, free_raw_data=False)
+    return lgb.train(params or PARAMS, ds, max(rounds, 50))
 
 
 def fit_calibrator(p, y):

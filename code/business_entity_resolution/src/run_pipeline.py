@@ -290,6 +290,8 @@ def main():
     pairs = pd.concat(parts, ignore_index=True)
     s1n = pd.concat(s1n_parts, ignore_index=True)
     tgtn = pd.concat(tgt_parts, ignore_index=True).drop_duplicates("entity_id")
+    del parts, s1n_parts, tgt_parts
+    gc.collect()
     y = label_pairs(pairs, truth)
     groups = pairs["s1_id"].values
     br = blocking_report(cands_dict(pairs), truth, 1)
