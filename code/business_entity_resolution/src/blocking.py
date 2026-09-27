@@ -238,9 +238,12 @@ def diagnose(kb: "KeyBlocker", s1c: pd.DataFrame, poolc: pd.DataFrame,
     k2 = record_keys(tp)
     k2["t_id"] = tp["entity_id"].values[k2["row"].values]
     kept = set(kb.w_by_hash.index.values)
-    m = k1[["s1_id", "h", "ktype"]].merge(k2[["t_id", "h"]], on="h")
+    # join on (true owner, key) so the merge is bounded by the true pairs;
+    # a plain join on the key alone explodes on common tokens (OOM at scale)
+    owner = pd.DataFrame(pairs, columns=["s1_id", "t_id"])
+    k2 = k2[["t_id", "h"]].merge(owner, on="t_id")
+    m = k1[["s1_id", "h", "ktype"]].merge(k2, on=["s1_id", "h"])
     true_set = set(pairs)
-    m = m[[(a, b) in true_set for a, b in zip(m["s1_id"].values, m["t_id"].values)]]
     shared_any = set(zip(m["s1_id"], m["t_id"]))
     mk = m[m["h"].isin(kept)]
     shared_kept = set(zip(mk["s1_id"], mk["t_id"]))

@@ -180,6 +180,85 @@ def error_analysis(pairs, X1, y, pred, truth, s1n, tgtn, n_examples=6):
             "fp_examples": ex(fp), "fn_examples": ex(fn)}
 
 
+
+# ---------------------------------------------------------------- parallel test scoring
+_CTX = None
+
+
+def _init_ctx(ctx):
+    global _CTX
+    _CTX = ctx
+
+
+CTX_TSUB_COLS = ("name_core", "addr_norm", "source")
+
+
+def _retrieve_chunk(ch):
+    """Worker: retrieval + pruning features (no LightGBM: OpenMP breaks after fork)."""
+    pr = _CTX["kb"].query(ch)
+    return ch, pr, (prune_features(pr) if len(pr) else None)
+
+
+def _feature_chunk(job):
+    """Worker: pairwise features for the pruned pairs of one chunk."""
+    ch, pr = job
+    c = _CTX
+    tsub = c["cp_idx"].loc[pd.unique(pr["t_id"])].reset_index(drop=True)
+    raw = (tsub[["entity_id", "business_name", "business_address", "country"]]
+           if c["use_llm"] else None)
+    X = make_features(pr, ch, tsub, c["idf"])[c["feat_cols"]]
+    return pr, tsub[["entity_id", *CTX_TSUB_COLS]], X, raw
+
+
+def _pool(ctx, workers):
+    import multiprocessing as mp
+    method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+    return ProcessPoolExecutor(workers, mp_context=mp.get_context(method),
+                               initializer=_init_ctx, initargs=(ctx,))
+
+
+def parallel_query(kb, df, workers, chunk=5000):
+    """kb.query over row chunks in worker processes (training side)."""
+    df = df.reset_index(drop=True)
+    chunks = [df.iloc[a:a + chunk] for a in range(0, len(df), chunk)]
+    if workers <= 1 or len(chunks) < 2:
+        return kb.query(df)
+    with _pool({"kb": kb}, workers) as ex:
+        out = [pr for _, pr, _ in ex.map(_retrieve_chunk_nofeat, chunks) if len(pr)]
+    return pd.concat(out, ignore_index=True) if out else kb.query(df.iloc[:0])
+
+
+def _retrieve_chunk_nofeat(ch):
+    return ch.iloc[:0], _CTX["kb"].query(ch), None
+
+
+def _map_chunks(ctx, chunks, workers):
+    """Retrieval and features run in workers; every model prediction runs here."""
+    ex = _pool(ctx, workers) if workers > 1 and len(chunks) > 1 else None
+    if ex is None:
+        _init_ctx(ctx)
+    mapper = ex.map if ex else map
+    try:
+        jobs, n_retr = [], 0
+        for ch, pr, pf in mapper(_retrieve_chunk, chunks):
+            n_retr += len(pr)
+            if len(pr):
+                pp = predict(ctx["pruner"], pf)
+                pr = pr[keep_mask(pr, pp, ctx["tau"], ctx["max_keep"])].reset_index(drop=True)
+            if len(pr):
+                jobs.append((ch, pr))
+        yield ("retrieved", n_retr)
+        for pr, tsub, X, raw in mapper(_feature_chunk, jobs):
+            p1 = predict(ctx["m1"], X)
+            L = context_local(pr, p1, tsub)
+            L.insert(0, "t_id", pr["t_id"].values)
+            L.insert(0, "s1_id", pr["s1_id"].values)
+            yield ("scored", L, raw)
+    finally:
+        if ex:
+            ex.shutdown()
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -198,7 +277,7 @@ def main():
     ap.add_argument("--query-chunk", type=int, default=2000)
     ap.add_argument("--prune-recall", type=float, default=0.995)
     ap.add_argument("--max-keep", type=int, default=10)
-    ap.add_argument("--test-chunk", type=int, default=100000)
+    ap.add_argument("--test-chunk", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--loco", action="store_true")
     ap.add_argument("--use-llm", action="store_true")
@@ -271,7 +350,7 @@ def main():
             log(f"[train:{country}] no pool records; skipped")
             continue
         kb = KeyBlocker(**blocker_kw).index(poolc)
-        pr = kb.query(s1c)
+        pr = parallel_query(kb, s1c, args.workers)
         indic = poolc["business_name"].str.contains("[\u0900-\u0D7F]", regex=True)
         idx_stats[country] = {
             "pool": len(poolc), "keys": kb.n_keys, "purged": kb.n_purged,
@@ -280,7 +359,8 @@ def main():
             "legal_form_present": round(float((poolc["name_suffix"] != "").mean()), 4),
             "postcode_present": round(float((poolc["addr_postcode"] != "").mean()), 4),
         }
-        diag = diagnose(kb, s1c, poolc, truth, pr)
+        ds = s1c.sample(min(len(s1c), 5000), random_state=0)
+        diag = diagnose(kb, ds, poolc, truth, pr[pr["s1_id"].isin(set(ds["entity_id"]))])
         idx_stats[country]["diagnosis"] = diag
         log(f"[diag:{country}] of true pairs: retrieved={diag.get('retrieved')}, "
             f"not in same-country pool={diag.get('target_not_in_same_country_pool')}, "
@@ -407,30 +487,22 @@ def main():
             idf = country_idf(cp, c1)
             cp_idx = cp.set_index("entity_id", drop=False)
             t_c = time.time()
-            for a in range(0, len(c1), args.test_chunk):
-                if a:
-                    rate = a / (time.time() - t_c)
-                    log(f"   [test:{country}] {a:,}/{len(c1):,} S1 done, "
-                        f"ETA for this country {(len(c1) - a) / rate / 60:.1f} min")
-                ch = c1.iloc[a:a + args.test_chunk]
-                pr = kb.query(ch)
-                n_retr += len(pr)
-                if len(pr) == 0:
+            chunks = [c1.iloc[a:a + args.test_chunk] for a in range(0, len(c1), args.test_chunk)]
+            ctx = dict(kb=kb, pruner=pruner, tau=tau, max_keep=args.max_keep, cp_idx=cp_idx,
+                       idf=idf, feat_cols=feat_cols, m1=m1, use_llm=args.use_llm)
+            done = 0
+            for out in _map_chunks(ctx, chunks, args.workers):
+                if out[0] == "retrieved":
+                    n_retr += out[1]
+                    log(f"   [test:{country}] retrieval+pruning done in {time.time() - t_c:.0f}s")
                     continue
-                pp = predict(pruner, prune_features(pr))
-                pr = pr[keep_mask(pr, pp, tau, args.max_keep)].reset_index(drop=True)
-                if len(pr) == 0:
-                    continue
-                tsub = cp_idx.loc[pd.unique(pr["t_id"])].reset_index(drop=True)
-                if args.use_llm:
-                    raw_keep.append(tsub[["entity_id", "business_name",
-                                          "business_address", "country"]])
-                X = make_features(pr, ch, tsub, idf)[feat_cols]
-                p1 = predict(m1, X)
-                L = context_local(pr, p1, tsub)
-                L.insert(0, "t_id", pr["t_id"].values)
-                L.insert(0, "s1_id", pr["s1_id"].values)
+                _, L, raw = out
                 rows.append(L)
+                if raw is not None:
+                    raw_keep.append(raw)
+                done += 1
+                if done % 10 == 0:
+                    log(f"   [test:{country}] features: {done} chunks scored")
             log(f"[test:{country}] S1={len(c1):,} pool={len(cp):,} "
                 f"kept pairs so far={sum(len(r) for r in rows):,}")
             del cp, cp_idx, kb
