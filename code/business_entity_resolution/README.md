@@ -33,16 +33,27 @@ Useful flags (pass them to `make_submission.py` after `--extra`):
 | flag | default | effect |
 | --- | --- | --- |
 | `--workers N` | cores-1 (max 8) | parallel normalization processes |
-| `--train-sample N` | 200000 | Source 1 training entities used for fitting; pool always complete |
+| `--train-sample N` | 60000 | Source 1 training entities used for fitting; pool always complete |
 | `--test-chunk N` | 100000 | S1 entities per test chunk; lower it if memory is tight |
-| `--df-cap N` | 500 | purge blocking keys shared by more pool records than this |
+| `--df-cap N` | 800 | purge blocking keys shared by more pool records than this |
 | `--prune-recall R` | 0.995 | share of retrieved true pairs the pruner keeps |
 | `--max-keep N` | 10 | hard cap on final candidates per entity |
+| `--k-retrieve N` | 200 | candidates per entity kept after key scoring |
+| `--k-max N` | 30 | candidates per entity passed to the pruner |
+| `--query-chunk N` | 2000 | S1 entities per blocking query (memory per step) |
 | `--loco` | off | leave-one-country-out check (France rehearsal) |
 | `--use-llm` | off | Qwen2.5-7B-Instruct judge on uncertain entities (GPU) |
 
-Expected cost on the full data: roughly 1 to 1.5 hours on a laptop with
-8 cores, with about 3 to 5 GB of RAM at peak (one country's pool at a time).
+On the full data the run prints a per-country ETA during the test phase.
+Memory peaks while one country's pool is indexed (the US pool is about 6M
+records). With 16 GB of RAM use the defaults; if Windows starts paging, lower
+`--train-sample` (e.g. 30000) and `--query-chunk` (e.g. 1000).
+
+The training log includes a blocking diagnosis per country: the share of true
+pairs retrieved, missing from the same-country pool, sharing no key, sharing
+only over-common keys, or ranked out. Use it to tune `--df-cap` (raise it if
+"only purged keys" is large) and `--k-retrieve` / `--k-max` (raise them if
+"ranked out" is large).
 
 ## Pipeline
 

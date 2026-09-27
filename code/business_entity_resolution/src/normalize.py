@@ -181,6 +181,22 @@ def mine_suffixes(raw_names, min_share: float = 0.002, max_len: int = 6) -> set:
     return found
 
 
+def compact_strings(df):
+    """Store text as Arrow strings (about 3x smaller than Python objects).
+
+    pandas 3 does this by default; pandas 2.x on Python 3.10 does not, which
+    tripled memory on the full data. Falls back silently without pyarrow.
+    """
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        return df
+    for c in df.columns:
+        if df[c].dtype == object or str(df[c].dtype) in ("str", "string"):
+            df[c] = df[c].astype("string[pyarrow]")
+    return df
+
+
 class Normalizer:
     def __init__(self, extra_name_abbrev=None, extra_addr_abbrev=None,
                  extra_suffixes=None):
@@ -269,4 +285,4 @@ class Normalizer:
                              index=df.index)
         out = pd.concat([df, names, addrs], axis=1)
         out["source"] = df["entity_id"].str.slice(0, 2)
-        return out
+        return compact_strings(out)

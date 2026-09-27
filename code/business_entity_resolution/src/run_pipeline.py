@@ -26,12 +26,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from blocking import KeyBlocker
+from blocking import KeyBlocker, diagnose
 from context import ALL_COLS, context_features, context_global, context_local
 from decode import apply_owner_constraint, decode
 from evaluate import blocking_report, macro_fbeta
 from features import make_features
-from model import feature_importance, fit_calibrator, fit_full, oof_predict
+from model import feature_importance, fit_calibrator, fit_full, oof_predict, predict
 from normalize import Normalizer, clean, fold, mine_abbreviations, mine_suffixes
 from prune import PRUNE_PARAMS, choose_tau, keep_mask, prune_features
 
@@ -188,12 +188,14 @@ def main():
     ap.add_argument("--report", default="run_report.json")
     ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 1)))
     ap.add_argument("--folds", type=int, default=5)
-    ap.add_argument("--train-sample", type=int, default=200000,
+    ap.add_argument("--train-sample", type=int, default=60000,
                     help="train S1 entities used for fitting (0 = all); pool stays whole")
     ap.add_argument("--prune-sample", type=int, default=50000)
-    ap.add_argument("--k-retrieve", type=int, default=150)
-    ap.add_argument("--k-max", type=int, default=25)
-    ap.add_argument("--df-cap", type=int, default=500)
+    ap.add_argument("--k-retrieve", type=int, default=200)
+    ap.add_argument("--k-mid", type=int, default=50)
+    ap.add_argument("--k-max", type=int, default=30)
+    ap.add_argument("--df-cap", type=int, default=800)
+    ap.add_argument("--query-chunk", type=int, default=2000)
     ap.add_argument("--prune-recall", type=float, default=0.995)
     ap.add_argument("--max-keep", type=int, default=10)
     ap.add_argument("--test-chunk", type=int, default=100000)
@@ -205,7 +207,8 @@ def main():
     data_dir, out_dir = Path(args.data_dir), Path(args.out_dir)
     rep = {"args": vars(args)}
     rng = np.random.default_rng(args.seed)
-    blocker_kw = dict(k_retrieve=args.k_retrieve, k_max=args.k_max, df_cap=args.df_cap)
+    blocker_kw = dict(k_retrieve=args.k_retrieve, k_mid=args.k_mid, k_max=args.k_max,
+                      df_cap=args.df_cap, chunk=args.query_chunk)
 
     # ============================ TRAIN ============================
     s1_all = read_tsv(data_dir / "train" / "train_source1.tsv")
@@ -277,6 +280,13 @@ def main():
             "legal_form_present": round(float((poolc["name_suffix"] != "").mean()), 4),
             "postcode_present": round(float((poolc["addr_postcode"] != "").mean()), 4),
         }
+        diag = diagnose(kb, s1c, poolc, truth, pr)
+        idx_stats[country]["diagnosis"] = diag
+        log(f"[diag:{country}] of true pairs: retrieved={diag.get('retrieved')}, "
+            f"not in same-country pool={diag.get('target_not_in_same_country_pool')}, "
+            f"no shared key={diag.get('no_shared_key')}, only purged keys="
+            f"{diag.get('only_purged_keys')}, ranked out={diag.get('shared_key_but_ranked_out')}"
+            f" | key coverage {diag.get('key_type_coverage')}")
         idf = country_idf(poolc, s1c)
         tsub = poolc[poolc["entity_id"].isin(set(pr["t_id"]))]
         parts.append(pr)
@@ -290,8 +300,6 @@ def main():
     pairs = pd.concat(parts, ignore_index=True)
     s1n = pd.concat(s1n_parts, ignore_index=True)
     tgtn = pd.concat(tgt_parts, ignore_index=True).drop_duplicates("entity_id")
-    del parts, s1n_parts, tgt_parts
-    gc.collect()
     y = label_pairs(pairs, truth)
     groups = pairs["s1_id"].values
     br = blocking_report(cands_dict(pairs), truth, 1)
@@ -313,7 +321,7 @@ def main():
     p_prune = np.empty(len(pairs))
     p_prune[fit_mask] = oofp
     if (~fit_mask).any():
-        p_prune[~fit_mask] = pruner.predict(PF[~fit_mask])
+        p_prune[~fit_mask] = predict(pruner, PF[~fit_mask])
     keep = keep_mask(pairs, p_prune, tau, args.max_keep)
     # per-country idf needs the country of each pair
     ctry = pairs["s1_id"].map(s1n.set_index("entity_id")["country"]).values
@@ -361,11 +369,11 @@ def main():
             tr, te = ctry != c, ctry == c
             m1 = fit_full(X1[tr], y[tr], it1)
             p1 = oof1.copy()
-            p1[te] = m1.predict(X1[te])
+            p1[te] = predict(m1, X1[te])
             Cc = context_features(pairs, p1, tgtn)
             m2 = fit_full(Cc[tr], y[tr], it2)
             d = pairs.loc[te, ["s1_id", "t_id"]].copy()
-            d["p"] = m2.predict(Cc[te])
+            d["p"] = predict(m2, Cc[te])
             ids = s1n.loc[s1n["country"] == c, "entity_id"].tolist()
             pred = decode(apply_owner_constraint(d, best_cfg["owner"]), ids, method="expected")
             rep["loco"][c] = macro_fbeta(pred, truth, ids=ids)
@@ -388,20 +396,28 @@ def main():
         for country in sorted(u1["country"].unique()):
             c1 = normalize(norm, u1[u1["country"] == country], args.workers)
             cp = normalize(norm, read_pool_country(data_dir, "test", country), args.workers)
+            if not args.use_llm:
+                cp = cp.drop(columns=["business_address", "country"], errors="ignore")
             valid.update(cp["entity_id"].values)
+            gc.collect()
             if len(cp) == 0:
                 log(f"[test:{country}] no pool records -> all empty")
                 continue
             kb = KeyBlocker(**blocker_kw).index(cp)
             idf = country_idf(cp, c1)
             cp_idx = cp.set_index("entity_id", drop=False)
+            t_c = time.time()
             for a in range(0, len(c1), args.test_chunk):
+                if a:
+                    rate = a / (time.time() - t_c)
+                    log(f"   [test:{country}] {a:,}/{len(c1):,} S1 done, "
+                        f"ETA for this country {(len(c1) - a) / rate / 60:.1f} min")
                 ch = c1.iloc[a:a + args.test_chunk]
                 pr = kb.query(ch)
                 n_retr += len(pr)
                 if len(pr) == 0:
                     continue
-                pp = pruner.predict(prune_features(pr))
+                pp = predict(pruner, prune_features(pr))
                 pr = pr[keep_mask(pr, pp, tau, args.max_keep)].reset_index(drop=True)
                 if len(pr) == 0:
                     continue
@@ -410,7 +426,7 @@ def main():
                     raw_keep.append(tsub[["entity_id", "business_name",
                                           "business_address", "country"]])
                 X = make_features(pr, ch, tsub, idf)[feat_cols]
-                p1 = m1.predict(X)
+                p1 = predict(m1, X)
                 L = context_local(pr, p1, tsub)
                 L.insert(0, "t_id", pr["t_id"].values)
                 L.insert(0, "s1_id", pr["s1_id"].values)
@@ -423,7 +439,7 @@ def main():
         G = context_global(T["s1_id"].values, T["t_id"].values, T["p1"].values)
         X2 = pd.concat([T.drop(columns=["s1_id", "t_id"]), G], axis=1)[ALL_COLS]
         udf = T[["s1_id", "t_id"]].copy()
-        udf["p"] = iso.predict(m2.predict(X2))
+        udf["p"] = iso.predict(predict(m2, X2))
         udf = apply_owner_constraint(udf, best_cfg["owner"])
         if args.use_llm:
             from llm_judge import LLMJudge

@@ -18,31 +18,39 @@ PARAMS = dict(
 )
 
 
+def _mat(X):
+    """Contiguous float32 matrix: avoids LightGBM's pandas/Arrow path, which
+    crashed with an access violation on Windows under memory pressure."""
+    return np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+
+
 def oof_predict(X, y, groups, n_folds=5, rounds=500, params=None):
     params = params or PARAMS
-    oof = np.zeros(len(y), dtype=np.float32)
+    names = list(X.columns) if hasattr(X, "columns") else None
+    X = _mat(X)
+    y = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
+    oof = np.zeros(len(y))
     best_iters = []
     gkf = GroupKFold(n_splits=n_folds)
-    feature_names = list(X.columns) if hasattr(X, "columns") else None
-    X_arr = np.ascontiguousarray(X.to_numpy(dtype=np.float32) if hasattr(X, "to_numpy") else X, dtype=np.float32)
-    y_arr = np.ascontiguousarray(y, dtype=np.float32)
-
-    for tr, va in gkf.split(X_arr, y_arr, groups):
-        dtr = lgb.Dataset(X_arr[tr], label=y_arr[tr], feature_name=feature_names, free_raw_data=False)
-        dva = lgb.Dataset(X_arr[va], label=y_arr[va], reference=dtr, feature_name=feature_names, free_raw_data=False)
+    for tr, va in gkf.split(X, y, groups):
+        dtr = lgb.Dataset(X[tr], y[tr], feature_name=names or "auto", free_raw_data=False)
+        dva = lgb.Dataset(X[va], y[va], reference=dtr, free_raw_data=False)
         m = lgb.train(params, dtr, rounds, valid_sets=[dva],
                       callbacks=[lgb.early_stopping(30, verbose=False)])
-        oof[va] = m.predict(X_arr[va], num_iteration=m.best_iteration)
+        oof[va] = m.predict(X[va], num_iteration=m.best_iteration)
         best_iters.append(m.best_iteration or rounds)
     return oof, int(np.mean(best_iters))
 
 
 def fit_full(X, y, rounds, params=None):
-    feature_names = list(X.columns) if hasattr(X, "columns") else None
-    X_arr = np.ascontiguousarray(X.to_numpy(dtype=np.float32) if hasattr(X, "to_numpy") else X, dtype=np.float32)
-    y_arr = np.ascontiguousarray(y, dtype=np.float32)
-    ds = lgb.Dataset(X_arr, label=y_arr, feature_name=feature_names, free_raw_data=False)
+    names = list(X.columns) if hasattr(X, "columns") else "auto"
+    ds = lgb.Dataset(_mat(X), np.asarray(y, dtype=np.float32), feature_name=names,
+                     free_raw_data=False)
     return lgb.train(params or PARAMS, ds, max(rounds, 50))
+
+
+def predict(model, X):
+    return model.predict(_mat(X))
 
 
 def fit_calibrator(p, y):

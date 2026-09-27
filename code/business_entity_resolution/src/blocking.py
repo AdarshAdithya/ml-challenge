@@ -6,7 +6,9 @@ records). No all-pairs comparison anywhere.
 1. Keys. Every record emits a handful of blocking keys from its normalized
    fields (country is handled by processing one country at a time):
      t   each consonant-skeleton token of the core name (typo/translit tolerant)
-     n2  first two skeleton tokens joined (specific even when tokens are common)
+     q   4-char prefix of each core-name token (catches consonant typos late
+         in a word, which change the skeleton)
+     n2  first two skeleton tokens, sorted (specific, and robust to word swaps)
      c   first 6 chars of the space-free core name ('wilfordhancock')
      p   postcode + first name skeleton
      a   first house number + the street word after it
@@ -31,52 +33,77 @@ from sklearn.preprocessing import normalize as l2norm
 
 from normalize import skeleton
 
-KEY_TYPES = ("t", "n2", "c", "p", "a")
+KEY_TYPES = ("t", "q", "n2", "c", "p", "a")
 _STREET = r"(?:^|\s)(\d+)\s+([a-z]{3,})"
 
 
-def record_keys(d: pd.DataFrame) -> pd.DataFrame:
-    """Return long table (row, h, ktype) of hashed blocking keys."""
-    rows = np.arange(len(d))
-    parts = []
-    tok = d["name_skel"].fillna("").str.split()
-    t = pd.DataFrame({"row": rows, "k": tok}).explode("k").dropna()
+def _hash(arr) -> np.ndarray:
+    return pd.util.hash_array(np.asarray(arr, dtype=object))
+
+
+def _keys_chunk(d: pd.DataFrame, offset: int):
+    """Hashed keys for one chunk; only numeric arrays leave this function."""
+    rows = np.arange(len(d)) + offset
+    R, H, K = [], [], []
+
+    def add(r, keys, kt):
+        if len(r):
+            R.append(np.asarray(r, np.int64))
+            H.append(_hash(keys))
+            K.append(np.full(len(r), kt, np.int8))
+
+    skel = d["name_skel"].astype(object).fillna("").str.split()
+    core = d["name_core"].astype(object).fillna("").str.split()
+    # t: every skeleton token
+    t = pd.DataFrame({"row": rows, "k": skel}).explode("k").dropna()
     t = t[t["k"].str.len() >= 2]
-    parts.append(pd.DataFrame({"row": t["row"].to_numpy(),
-                               "k": "t|" + t["k"].astype(str).to_numpy(object),
-                               "ktype": 0}))
-    ntok = tok.str.len().fillna(0).to_numpy()
-    m = ntok >= 2
-    two = tok[m].str[:2].str.join("_").astype(str)
-    parts.append(pd.DataFrame({"row": rows[m], "k": "n|" + two.to_numpy(object),
-                               "ktype": 1}))
-    comp = d["name_core"].fillna("").str.replace(" ", "", regex=False)
-    m = (comp.str.len() >= 4).to_numpy()
-    parts.append(pd.DataFrame({"row": rows[m],
-                               "k": "c|" + comp[m].str[:6].astype(str).to_numpy(object),
-                               "ktype": 2}))
-    pc = d["addr_postcode"].fillna("").str.split().str[0]
-    f1 = tok.str[0]
-    m = (pc.notna() & f1.notna()).to_numpy()
-    if m.any():
-        parts.append(pd.DataFrame({
-            "row": rows[m],
-            "k": ("p|" + pc[m].astype(str) + "|" + f1[m].astype(str)).to_numpy(object),
-            "ktype": 3}))
-    st = d["addr_norm"].fillna("").str.extract(_STREET)
-    m = st[0].notna().to_numpy()
+    add(t["row"].values, ("t|" + t["k"].astype(str)).values, 0)
+    # q: 4-char prefix of every core token (typos near the end, vowel changes)
+    q = pd.DataFrame({"row": rows, "k": core}).explode("k").dropna()
+    q = q[q["k"].str.len() >= 4]
+    add(q["row"].values, ("q|" + q["k"].astype(str).str[:4]).values, 1)
+    # n2: first two skeleton tokens, order-insensitive (word transpositions)
+    two = skel.map(lambda x: "_".join(sorted(x[:2])) if len(x) >= 2 else None)
+    m = two.notna().values
+    add(rows[m], ("n|" + two[m].astype(str)).values, 2)
+    # c: space-free core-name prefix ('wilfordhancock' vs 'wilford hancock')
+    comp = d["name_core"].astype(object).fillna("").str.replace(" ", "", regex=False)
+    m = (comp.str.len() >= 4).values
+    add(rows[m], ("c|" + comp[m].str[:6]).values, 3)
+    # p: postcode + first name skeleton
+    pc = d["addr_postcode"].astype(object).fillna("").str.split().str[0]
+    f1 = skel.str[0]
+    m = (pc.notna() & f1.notna()).values
+    add(rows[m], ("p|" + pc[m].astype(str) + "|" + f1[m].astype(str)).values, 4)
+    # a: house number + street word after it
+    st = d["addr_norm"].astype(object).fillna("").str.extract(_STREET)
+    m = st[0].notna().values
     if m.any():
         street = st.loc[m, 1].astype(str).map(skeleton)
-        parts.append(pd.DataFrame({
-            "row": rows[m],
-            "k": ("a|" + st.loc[m, 0].astype(str) + "|" + street).to_numpy(object),
-            "ktype": 4}))
-    keys = pd.concat(parts, ignore_index=True)
-    keys["h"] = pd.util.hash_array(keys["k"].to_numpy(dtype=object))
-    return keys[["row", "h", "ktype"]].drop_duplicates(["row", "h"])
+        add(rows[m], ("a|" + st.loc[m, 0].astype(str) + "|" + street).values, 5)
+    if not R:
+        return np.empty(0, np.int64), np.empty(0, np.uint64), np.empty(0, np.int8)
+    return np.concatenate(R), np.concatenate(H), np.concatenate(K)
+
+
+def record_keys(d: pd.DataFrame, chunk: int = 200_000) -> pd.DataFrame:
+    """Long table (row, h, ktype) of hashed blocking keys, built in chunks."""
+    R, H, K = [], [], []
+    for a in range(0, len(d), chunk):
+        r, h, k = _keys_chunk(d.iloc[a:a + chunk], a)
+        R.append(r), H.append(h), K.append(k)
+    if not R:
+        return pd.DataFrame({"row": np.empty(0, np.int64), "h": np.empty(0, np.uint64),
+                             "ktype": np.empty(0, np.int8)})
+    out = pd.DataFrame({"row": np.concatenate(R), "h": np.concatenate(H),
+                        "ktype": np.concatenate(K)})
+    return out.drop_duplicates(["row", "h"])
 
 
 def _texts(d, name):
+    d = d.astype({c: object for c in ("name_core", "name_alt", "addr_words",
+                                      "addr_postcode", "addr_norm", "name_skel")
+                  if c in d.columns})
     if name == "cos_name_char":
         return (d["name_core"] + " " + d["name_alt"]).tolist()
     if name == "cos_all_word":
@@ -107,7 +134,7 @@ COLUMNS = (["s1_id", "t_id", "kb_score", "kb_norm", "kb_nkeys"] + [f"kb_{k}" for
 
 
 class KeyBlocker:
-    def __init__(self, k_retrieve=150, k_mid=40, k_max=25, df_cap=500, chunk=5000,
+    def __init__(self, k_retrieve=300, k_mid=60, k_max=30, df_cap=1000, chunk=2000,
                  idf_sample=300000, seed=0):
         self.k_retrieve, self.k_mid, self.k_max = k_retrieve, k_mid, k_max
         self.df_cap, self.chunk = df_cap, chunk
@@ -195,3 +222,40 @@ class KeyBlocker:
         agg["s1_id"] = c["entity_id"].to_numpy()[agg["i"].to_numpy()]
         agg["t_id"] = self.pool["entity_id"].to_numpy()[agg["j"].to_numpy()]
         return agg[COLUMNS].reset_index(drop=True)
+
+
+def diagnose(kb: "KeyBlocker", s1c: pd.DataFrame, poolc: pd.DataFrame,
+             truth: dict, retrieved: pd.DataFrame) -> dict:
+    """Explain where true pairs are lost for one country (training only)."""
+    pairs = [(s, t) for s in s1c["entity_id"].values for t in truth.get(s, [])]
+    n = len(pairs)
+    if n == 0:
+        return {}
+    in_pool = set(poolc["entity_id"].values)
+    tp = poolc[poolc["entity_id"].isin({t for _, t in pairs})].reset_index(drop=True)
+    k1 = record_keys(s1c.reset_index(drop=True))
+    k1["s1_id"] = s1c["entity_id"].values[k1["row"].values]
+    k2 = record_keys(tp)
+    k2["t_id"] = tp["entity_id"].values[k2["row"].values]
+    kept = set(kb.w_by_hash.index.values)
+    m = k1[["s1_id", "h", "ktype"]].merge(k2[["t_id", "h"]], on="h")
+    true_set = set(pairs)
+    m = m[[(a, b) in true_set for a, b in zip(m["s1_id"].values, m["t_id"].values)]]
+    shared_any = set(zip(m["s1_id"], m["t_id"]))
+    mk = m[m["h"].isin(kept)]
+    shared_kept = set(zip(mk["s1_id"], mk["t_id"]))
+    got = set(zip(retrieved["s1_id"], retrieved["t_id"]))
+    not_in_pool = sum(1 for _, t in pairs if t not in in_pool)
+    no_key = sum(1 for p in pairs if p[1] in in_pool and p not in shared_any)
+    purged_only = sum(1 for p in pairs if p in shared_any and p not in shared_kept)
+    ranked_out = sum(1 for p in pairs if p in shared_kept and p not in got)
+    by_type = mk.drop_duplicates(["s1_id", "t_id", "ktype"])["ktype"].value_counts()
+    return {
+        "true_pairs": n,
+        "target_not_in_same_country_pool": round(not_in_pool / n, 4),
+        "no_shared_key": round(no_key / n, 4),
+        "only_purged_keys": round(purged_only / n, 4),
+        "shared_key_but_ranked_out": round(ranked_out / n, 4),
+        "retrieved": round(len(got & true_set) / n, 4),
+        "key_type_coverage": {KEY_TYPES[int(k)]: round(v / n, 4) for k, v in by_type.items()},
+    }

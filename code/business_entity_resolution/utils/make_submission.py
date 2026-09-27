@@ -68,6 +68,15 @@ def build_doc(rep: dict, team: str, members: str) -> str:
         return "; ".join(f"{k} ({v})" for k, v in list(d.items())[:5]) or "n/a"
 
     n_pairs = test.get("n_pairs")
+    diag_rows = "\n".join(
+        f"| {c} | {v.get('diagnosis', {}).get('retrieved')} | "
+        f"{v.get('diagnosis', {}).get('target_not_in_same_country_pool')} | "
+        f"{v.get('diagnosis', {}).get('no_shared_key')} | "
+        f"{v.get('diagnosis', {}).get('only_purged_keys')} | "
+        f"{v.get('diagnosis', {}).get('shared_key_but_ranked_out')} |"
+        for c, v in idx.items()) or "| n/a | | | | | |"
+    diag_cov = "; ".join(f"{c}: {v.get('diagnosis', {}).get('key_type_coverage')}"
+                         for c, v in idx.items()) or "n/a"
     return f"""# ML Challenge 2026: Business Entity Resolution Solution Template
 
 **Team Name:** {team}
@@ -142,7 +151,8 @@ country label as found in the data, so France goes through the same path.
 - **Blocking keys used:** per record, hashed to uint64 and matched within the
   same country label:
   (t) each consonant-skeleton token of the core name,
-  (n2) the first two skeleton tokens joined,
+  (q) the 4-character prefix of each core-name token,
+  (n2) the first two skeleton tokens, sorted (robust to word swaps),
   (c) the first six characters of the space-free core name,
   (p) postcode + first name skeleton,
   (a) first house number + the street word after it.
@@ -165,6 +175,15 @@ country label as found in the data, so France goes through the same path.
 | --- | --- | --- | --- |
 | after retrieval | {fmt(rt.get('pair_recall'))} | {fmt(rt.get('avg_cands_per_s1'), 2)} | {fmt(rt.get('f05_ceiling'))} |
 | after learned pruning | {fmt(bt.get('pair_recall'))} | {fmt(bt.get('avg_cands_per_s1'), 2)} | {fmt(bt.get('f05_ceiling'))} |
+
+Where true pairs are lost (training diagnosis, share of true pairs):
+
+| country | retrieved | not in same-country pool | no shared key | only over-common keys | ranked out |
+| --- | --- | --- | --- | --- | --- |
+{diag_rows}
+
+Coverage by key family (share of true pairs sharing at least one key of that type):
+{diag_cov}
 
 Every step processes Source 1 in chunks against a per-country index, so work
 grows linearly with the number of entities; no all-pairs comparison is made.

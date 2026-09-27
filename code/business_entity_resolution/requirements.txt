@@ -1,14 +1,12 @@
-# core (tested with Python 3.12)
-numpy==2.4.4
-pandas==3.0.2
-scipy==1.17.1
-scikit-learn==1.8.0
-lightgbm==4.7.0
-rapidfuzz==3.14.6
-pyarrow==25.0.1          # compact Arrow strings: ~3x less memory in pandas 3
+# Works on Python 3.10-3.12 (tested with these pins on 3.10-compatible builds)
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0          # compact Arrow strings: ~3x less memory
+scipy==1.13.1
+scikit-learn==1.5.2
+lightgbm==4.5.0
+rapidfuzz==3.10.1
 
-# optional: --use-embeddings (intfloat/multilingual-e5-small, MIT license)
-# sentence-transformers>=3.0
 # optional: --use-llm (Qwen/Qwen2.5-7B-Instruct, Apache 2.0, needs a GPU)
 # transformers>=4.45
 # torch>=2.3
